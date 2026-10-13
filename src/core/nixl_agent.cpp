@@ -1334,26 +1334,28 @@ nixl_status_t
 nixlAgent::releaseXferReq(nixlXferReqH *req_hndl) const {
 
     NIXL_SHARED_LOCK_GUARD(data->lock);
-    //attempt to cancel request
-    if(req_hndl->status == NIXL_IN_PROG) {
-        req_hndl->status = req_hndl->engine->checkXfer(
-                                     req_hndl->backendHandle);
-
-        if(req_hndl->status == NIXL_IN_PROG) {
-
-            req_hndl->status = req_hndl->engine->releaseReqH(
-                                         req_hndl->backendHandle);
-
-            if (req_hndl->status < 0) {
-                NIXL_ERROR_FUNC << "backend '" << req_hndl->engine->getType()
-                                << "' could not release transfer request and returned error status "
-                                << req_hndl->status;
-                return NIXL_ERR_REPOST_ACTIVE; // Might need renaming
-            }
-            // just in case the backend doesn't set to NULL on success
-            // this will prevent calling releaseReqH again in destructor
-            req_hndl->backendHandle = nullptr;
+    if (req_hndl->backendHandle != nullptr) {
+        // A queue error is not proof that callbacks have been reaped.  Advance
+        // physical I/O even after ERR while preserving the first observed
+        // transfer error for the caller.
+        const nixl_status_t observed =
+            req_hndl->engine->checkXfer(req_hndl->backendHandle);
+        if (req_hndl->status == NIXL_IN_PROG) {
+            req_hndl->status = observed;
         }
+
+        // Backends may refuse release while an active request is still
+        // pollable.  Preserve that state so callers can drain and retry;
+        // destructor-only cleanup is not physical release proof.
+        const nixl_status_t release_status =
+            req_hndl->engine->releaseReqH(req_hndl->backendHandle);
+        if (release_status != NIXL_SUCCESS) {
+            NIXL_DEBUG << "backend '" << req_hndl->engine->getType()
+                       << "' retained transfer request with release status "
+                       << release_status;
+            return release_status;
+        }
+        req_hndl->backendHandle = nullptr;
     }
     delete req_hndl;
     return NIXL_SUCCESS;
